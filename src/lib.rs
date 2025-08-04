@@ -154,9 +154,6 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                 let mut mfa_required = true;
                 let mut mfa_count = 0;
                 while mfa_required {
-                    // If MFA is passed twice, it means the user has passed an sms and email mfa
-                    // which should clear the IP. We just need to reinitialize the session
-                    // and login again to access the account.
                     if mfa_count == 2 {
                         warn!("MFA thresold reached. Trying to login again by reinitalizing the session.");
                         web_client = get_client();
@@ -236,7 +233,6 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                                 .map(|s| s.as_str())
                                 .unwrap();
 
-                            // Get account from previously fetched accounts
                             let account = accounts
                                 .iter()
                                 .find(|a| a.id == account_id)
@@ -271,7 +267,13 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
 
                             let summary = web_client.get_trading_summary(account.clone()).await?;
 
-                            info!("Found {} positions", summary.len());
+                            let total_positions = summary
+                                .iter()
+                                .map(|item| item.positions.as_ref().map_or(0, |p| p.len()))
+                                .sum::<usize>();
+
+                            info!("Found {} positions", total_positions);
+
                             for item in summary {
                                 if let Some(positions) = item.positions {
                                     for position in positions {
