@@ -41,7 +41,21 @@ lazy_static::lazy_static! {
     /// Matches: userContact&quot;:&quot;<contact>&quot;
     static ref USER_CONTACT_REGEX: Regex = Regex::new(r"(?m)userContact&quot;:&quot;(?P<contact_user>.*?)&quot;")
         .expect("Failed to compile user contact regex");
+
+    /// Regex to extract an identity link from the identity chooser page.
+    /// Matches: /connexion/changer-identite/<hash>
+    static ref IDENTITY_LINK_REGEX: Regex = Regex::new(r"/connexion/changer-identite/(?P<hash>[a-f0-9]{32,128})")
+        .expect("Failed to compile identity link regex");
+
+    /// Regex to extract the first short text node of an HTML fragment, used as
+    /// a best-effort label for an identity.
+    /// Matches: >Compte professionnel<
+    static ref HTML_TEXT_NODE_REGEX: Regex = Regex::new(r">\s*(?P<label>[^<>\s][^<>]{2,60}?)\s*<")
+        .expect("Failed to compile HTML text node regex");
 }
+
+/// Path the website redirects to when a login gives access to several identities.
+const IDENTITY_SELECTION_PATH: &str = "/connexion/lister-identites";
 
 pub struct BoursoWebClient {
     /// The client used to make requests to the Bourso website.
@@ -64,6 +78,20 @@ pub struct BoursoWebClient {
     cookie_store: Arc<CookieStoreMutex>,
     /// Bourso Web current configuration
     pub config: Config,
+}
+
+/// An identity reachable behind a single login.
+///
+/// Some BoursoBank logins give access to several identities (typically a personal
+/// and a professional space sharing one customer id). In that case the password
+/// step succeeds but the website redirects to an identity chooser, and one
+/// identity has to be selected before the session can be used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Identity {
+    /// Opaque hash identifying the identity, used to switch to it.
+    pub hash: String,
+    /// Label displayed by the website. Empty when it could not be parsed.
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -299,12 +327,114 @@ impl BoursoWebClient {
             if res.contains("/securisation") {
                 bail!(ClientError::MfaRequired)
             }
+            // The password was accepted but this login gives access to several
+            // identities: the website redirects to the identity chooser and the
+            // session is unusable until one is picked.
+            if res.contains(IDENTITY_SELECTION_PATH) {
+                bail!(ClientError::IdentitySelectionRequired)
+            }
             debug!("{}", res);
 
             bail!(ClientError::InvalidCredentials)
         }
 
         Ok(())
+    }
+
+    /// List the identities reachable behind the current login.
+    ///
+    /// Only meaningful once the password step has reported
+    /// [`ClientError::IdentitySelectionRequired`].
+    ///
+    /// # Returns
+    ///
+    /// The identities as a vector of `Identity`, in the order the website lists them.
+    #[cfg(not(tarpaulin_include))]
+    pub async fn list_identities(&self) -> Result<Vec<Identity>> {
+        let res = self
+            .client
+            .get(format!("{BASE_URL}{IDENTITY_SELECTION_PATH}"))
+            .headers(self.get_headers())
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        let identities = extract_identities(&res);
+
+        if identities.is_empty() {
+            debug!("{}", res);
+            bail!("Could not extract any identity from the identity chooser page");
+        }
+
+        Ok(identities)
+    }
+
+    /// Switch the session to the given identity.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The identity to switch to, as returned by [`Self::list_identities`].
+    ///
+    /// # Returns
+    ///
+    /// Nothing if the session is usable afterwards, an error otherwise.
+    #[cfg(not(tarpaulin_include))]
+    pub async fn switch_identity(&mut self, identity: &Identity) -> Result<()> {
+        let res = self
+            .client
+            .get(format!(
+                "{BASE_URL}/connexion/changer-identite/{}",
+                identity.hash
+            ))
+            .headers(self.get_headers())
+            .send()
+            .await?;
+
+        debug!("Switching identity returned status {}", res.status());
+
+        let res = self
+            .client
+            .get(format!("{BASE_URL}/"))
+            .headers(self.get_headers())
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        if res.contains(r#"href="/se-deconnecter""#) {
+            // Update the config with the user hash of the selected identity
+            self.config = extract_brs_config(&res)?;
+            info!(
+                "🔓 You are now logged in with user: {}",
+                self.config.user_hash.as_ref().unwrap()
+            );
+
+            return Ok(());
+        }
+
+        if res.contains("/securisation") {
+            bail!(ClientError::MfaRequired)
+        }
+
+        debug!("{}", res);
+
+        bail!("Could not switch to the requested identity")
+    }
+
+    /// Whether the session is still waiting for an identity to be selected.
+    #[cfg(not(tarpaulin_include))]
+    pub async fn is_identity_selection_pending(&self) -> Result<bool> {
+        let res = self
+            .client
+            .get(format!("{BASE_URL}/"))
+            .headers(self.get_headers())
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        Ok(res.contains(IDENTITY_SELECTION_PATH))
     }
 
     /// Request the MFA code to be sent to the user.
@@ -618,9 +748,85 @@ fn extract_user_contact(res: &str) -> Result<String> {
     Ok(contact_user)
 }
 
+/// Extract the identities from the identity chooser page.
+///
+/// The chooser markup is not documented, so the label is best-effort: we take the
+/// first short text node that follows the identity link and fall back to an empty
+/// string. The hash, which is what actually matters to switch identity, is matched
+/// on the link itself and is therefore not affected.
+///
+/// # Arguments
+///
+/// * `res` - The content of the `/connexion/lister-identites` page as a string.
+///
+/// # Returns
+///
+/// The identities found, deduplicated, in the order they appear in the page.
+fn extract_identities(res: &str) -> Vec<Identity> {
+    let mut identities: Vec<Identity> = Vec::new();
+
+    for captures in IDENTITY_LINK_REGEX.captures_iter(res) {
+        let hash = captures.name("hash").unwrap().as_str().to_string();
+
+        // The same identity is often linked more than once (icon + label)
+        if identities.iter().any(|identity| identity.hash == hash) {
+            continue;
+        }
+
+        // Look for a label in the markup that immediately follows the link,
+        // taking care not to slice in the middle of a UTF-8 character.
+        let after = &res[captures.get(0).unwrap().end()..];
+        let mut window_end = after.len().min(800);
+        while window_end > 0 && !after.is_char_boundary(window_end) {
+            window_end -= 1;
+        }
+
+        let label = HTML_TEXT_NODE_REGEX
+            .captures(&after[..window_end])
+            .and_then(|c| c.name("label"))
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+
+        identities.push(Identity { hash, label });
+    }
+
+    identities
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_identities() {
+        let res = r#"<ul class="c-identity-list"><li class="c-identity-list__item"><a class="c-identity-list__link" href="/connexion/changer-identite/1111111111111111111111111111111111111111111111111111111111111111"><span class="c-identity-list__label">Compte professionnel</span></a></li><li class="c-identity-list__item"><a class="c-identity-list__link" href="/connexion/changer-identite/2222222222222222222222222222222222222222222222222222222222222222"><span class="c-identity-list__label">Compte personnel</span></a></li></ul>"#;
+
+        let identities = extract_identities(res);
+
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].hash, "1111111111111111111111111111111111111111111111111111111111111111");
+        assert_eq!(identities[0].label, "Compte professionnel");
+        assert_eq!(identities[1].hash, "2222222222222222222222222222222222222222222222222222222222222222");
+        assert_eq!(identities[1].label, "Compte personnel");
+    }
+
+    #[test]
+    fn test_extract_identities_deduplicates_and_survives_missing_label() {
+        // Same identity linked twice, and a second one with no text node after it
+        let res = r#"<a href="/connexion/changer-identite/3333333333333333333333333333333333333333333333333333333333333333"><img src="/icon.png"/></a><a href="/connexion/changer-identite/3333333333333333333333333333333333333333333333333333333333333333">Pro</a><a href="/connexion/changer-identite/4444444444444444444444444444444444444444444444444444444444444444"/>"#;
+
+        let identities = extract_identities(res);
+
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].hash, "3333333333333333333333333333333333333333333333333333333333333333");
+        assert_eq!(identities[1].hash, "4444444444444444444444444444444444444444444444444444444444444444");
+        assert_eq!(identities[1].label, "");
+    }
+
+    #[test]
+    fn test_extract_identities_empty_when_absent() {
+        assert!(extract_identities("<html><body>no identity here</body></html>").is_empty());
+    }
 
     #[test]
     fn test_extract_brs_mit_cookie() {

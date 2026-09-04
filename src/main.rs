@@ -108,6 +108,16 @@ async fn main() -> Result<()> {
                     // )
                     .subcommand_required(true)
                 )
+                .subcommand(
+                    Command::new("position")
+                        .about("Manage your positions in your trading account")
+                        .subcommand(
+                            Command::new("list")
+                                .about("List all your positions in your trading account")
+                                .arg(account_arg.clone())
+                        )
+                        .subcommand_required(true)
+                )
                 .subcommand_required(true)
         )
         .subcommand(
@@ -235,6 +245,17 @@ async fn main() -> Result<()> {
             Arg::new("credentials")
                 .long("credentials")
                 .help("The path to the credentials file")
+                .value_parser(clap::value_parser!(String))
+                .required(false)
+        )
+        .arg(
+            Arg::new("identity")
+                .long("identity")
+                .help(
+                    r#"Which identity to use when your login gives access to several
+    (e.g. a personal and a professional space sharing one customer id).
+    Accepts a 1-based index or part of the identity label. Omit it once to list them."#
+                )
                 .value_parser(clap::value_parser!(String))
                 .required(false)
         )

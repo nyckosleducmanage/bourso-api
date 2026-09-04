@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bourso_api::{
     account::{Account, AccountKind, Transaction},
     client::{
         trade::{order::OrderSide, tick::QuoteTab},
         transfer::TransferProgress,
-        BoursoWebClient,
+        BoursoWebClient, Identity,
     },
     get_client,
 };
@@ -17,6 +17,74 @@ pub mod settings;
 pub mod validate;
 
 use settings::{get_settings, save_settings, Settings};
+
+/// Pick the identity to use among those reachable behind the login.
+///
+/// # Arguments
+///
+/// * `identities` - The identities available, as listed by the website.
+/// * `requested` - The `--identity` value: a 1-based index or part of a label.
+///
+/// # Returns
+///
+/// The selected identity, or an error listing the available ones when the request
+/// is missing or ambiguous.
+#[cfg(not(tarpaulin_include))]
+fn select_identity(identities: &[Identity], requested: Option<&str>) -> Result<Identity> {
+    // Nothing to choose from
+    if identities.len() == 1 {
+        return Ok(identities[0].clone());
+    }
+
+    if let Some(requested) = requested {
+        // A 1-based index takes precedence, as labels are only best-effort
+        if let Ok(index) = requested.parse::<usize>() {
+            if index >= 1 && index <= identities.len() {
+                return Ok(identities[index - 1].clone());
+            }
+
+            bail!(
+                "Identity index {} is out of range, this login has {} identities",
+                index,
+                identities.len()
+            );
+        }
+
+        let needle = requested.to_lowercase();
+        let matched = identities
+            .iter()
+            .filter(|identity| identity.label.to_lowercase().contains(&needle))
+            .collect::<Vec<_>>();
+
+        if matched.len() == 1 {
+            return Ok(matched[0].clone());
+        }
+
+        if matched.len() > 1 {
+            bail!(
+                "'{}' matches {} identities, use the index instead",
+                requested,
+                matched.len()
+            );
+        }
+
+        warn!("No identity matches '{}'.", requested);
+    }
+
+    warn!("This login gives access to several identities:");
+    for (index, identity) in identities.iter().enumerate() {
+        let label = if identity.label.is_empty() {
+            "(label not found)"
+        } else {
+            identity.label.as_str()
+        };
+        // Show a hash prefix so identities can be told apart even without a label
+        let hash_prefix = &identity.hash[..8.min(identity.hash.len())];
+        warn!("  {}. {} [{}…]", index + 1, label, hash_prefix);
+    }
+
+    bail!("Select one with --identity <index|label>, e.g. `--identity 1` (before the subcommand)")
+}
 
 #[cfg(not(tarpaulin_include))]
 pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
@@ -149,12 +217,20 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
 
     let mut web_client: BoursoWebClient = get_client();
     web_client.init_session().await?;
+    // Set when the password step succeeded but an identity still has to be picked
+    let mut identity_pending = false;
+    // Set when we went through the MFA flow, which can also end on the identity chooser
+    let mut came_through_mfa = false;
     match web_client.login(&customer_id, &password).await {
         Ok(_) => {
             info!("Login successful ✅");
         }
         Err(e) => match e.downcast_ref() {
+            Some(bourso_api::client::error::ClientError::IdentitySelectionRequired) => {
+                identity_pending = true;
+            }
             Some(bourso_api::client::error::ClientError::MfaRequired) => {
+                came_through_mfa = true;
                 warn!("An MFA is required.");
 
                 let (otp_id, form_state, token, mfa_type) = match web_client.request_mfa().await {
@@ -234,6 +310,26 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                 return Err(e);
             }
         },
+    }
+
+    // Logins that give access to several identities (e.g. a personal and a
+    // professional space) land on an identity chooser: the session is not usable
+    // until one is selected. The MFA flow can end there too, so probe in that case.
+    if identity_pending || (came_through_mfa && web_client.is_identity_selection_pending().await?) {
+        let identities = web_client.list_identities().await?;
+        let requested = matches.get_one::<String>("identity").map(|s| s.as_str());
+        let identity = select_identity(&identities, requested)?;
+
+        info!(
+            "Selecting identity: {}",
+            if identity.label.is_empty() {
+                identity.hash.as_str()
+            } else {
+                identity.label.as_str()
+            }
+        );
+
+        web_client.switch_identity(&identity).await?;
     }
 
     let accounts: Vec<Account>;
@@ -358,6 +454,69 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                             let _ = web_client
                                 .order(side.to_owned(), account, symbol, quantity.to_owned(), None)
                                 .await?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Some(("position", position_matches)) => {
+                    match position_matches.subcommand() {
+                        Some(("list", list_matches)) => {
+                            let account_id = list_matches
+                                .get_one::<String>("account")
+                                .map(|s| s.as_str())
+                                .unwrap();
+
+                            let account = accounts
+                                .iter()
+                                .find(|a| a.id == account_id)
+                                .context("Account not found. Are you sure you have access to it? Run `bourso accounts` to list your accounts")?;
+
+                            let summary = web_client.get_trading_summary(account.clone()).await?;
+
+                            // The endpoint returns an "account" item (cash, valuation)
+                            // alongside the "positions" item
+                            for item in summary.iter() {
+                                if let Some(account_summary) = item.account.as_ref() {
+                                    let currency = account_summary
+                                        .cash
+                                        .currency
+                                        .as_deref()
+                                        .unwrap_or(account_summary.currency.as_str());
+
+                                    info!(
+                                        "{}: cash {} {}, positions {} {}, total {} {}",
+                                        account_summary.name,
+                                        account_summary.cash.value,
+                                        currency,
+                                        account_summary.valuation.value,
+                                        currency,
+                                        account_summary.total.value,
+                                        currency
+                                    );
+                                }
+                            }
+
+                            let total_positions = summary
+                                .iter()
+                                .map(|item| item.positions.as_ref().map_or(0, |p| p.len()))
+                                .sum::<usize>();
+
+                            info!("Found {} positions", total_positions);
+
+                            for item in summary {
+                                if let Some(positions) = item.positions {
+                                    for position in positions {
+                                        info!(
+                                            "Symbol: {} ({}), Quantity: {}, Amount: {} {}",
+                                            position.label,
+                                            position.symbol,
+                                            position.quantity.value,
+                                            position.amount.value,
+                                            position.amount.currency.as_deref().unwrap_or("")
+                                        );
+                                    }
+                                }
+                            }
                         }
                         _ => unreachable!(),
                     }
