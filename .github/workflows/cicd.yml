@@ -6,14 +6,17 @@ on:
     tags: 
       - v*.*.*
 
+# Least privilege by default; jobs that need to write raise it for themselves.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    permissions:
+      contents: write # To create the draft release and upload its assets.
     outputs:
       hash-ubuntu-latest: ${{ steps.hash.outputs.hash-ubuntu-latest }}
       hash-macos-latest: ${{ steps.hash.outputs.hash-macos-latest }}
@@ -27,7 +30,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # When rustup is updated, it tries to replace its binary, which on Windows is somehow locked.
       # This can result in the CI failure, see: https://github.com/rust-lang/rustup/issues/3029
@@ -36,13 +39,13 @@ jobs:
           rustup toolchain install stable --profile minimal
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
           components: rustfmt
 
       - name: Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check and test
         run: |
@@ -86,7 +89,7 @@ jobs:
           echo "hash-windows-latest=$base64Hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3.0.3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         if: startsWith(github.ref, 'refs/tags/')
         with:
           draft: true

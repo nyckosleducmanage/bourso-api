@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Rust dependencies of the CLI and of the bourso_api crate it embeds
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /src/bourso_api
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Keeps the workflow actions from drifting into deprecated runtimes
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
