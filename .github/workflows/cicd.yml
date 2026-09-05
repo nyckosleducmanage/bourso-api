@@ -27,7 +27,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # When rustup is updated, it tries to replace its binary, which on Windows is somehow locked.
       # This can result in the CI failure, see: https://github.com/rust-lang/rustup/issues/3029
@@ -86,7 +86,7 @@ jobs:
           echo "hash-windows-latest=$base64Hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2.0.4
+        uses: softprops/action-gh-release@v3.0.3
         if: startsWith(github.ref, 'refs/tags/')
         with:
           draft: true
