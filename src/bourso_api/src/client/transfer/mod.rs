@@ -138,10 +138,15 @@ impl BoursoWebClient {
 
         let res = self.client.post(&url).multipart(data).send().await?;
 
-        if res.status() != 200 {
-            debug!("Set debit account response: {:?}", res);
+        let status = res.status();
+        let body = res.text().await?;
+
+        if status != 200 {
+            debug!("Set debit account response: {}", body);
             bail!(TransferError::SetDebitAccountFailed);
         }
+
+        log_flow_step("set debit account", &body);
 
         Ok(())
     }
@@ -177,10 +182,15 @@ impl BoursoWebClient {
 
         let res = self.client.post(&url).multipart(data).send().await?;
 
-        if res.status() != 200 {
-            debug!("Set credit account response: {:?}", res);
+        let status = res.status();
+        let body = res.text().await?;
+
+        if status != 200 {
+            debug!("Set credit account response: {}", body);
             bail!(TransferError::SetCreditAccountFailed);
         }
+
+        log_flow_step("set credit account", &body);
 
         Ok(())
     }
@@ -211,10 +221,15 @@ impl BoursoWebClient {
 
         let res = self.client.post(&url).multipart(data).send().await?;
 
-        if res.status() != 200 {
-            debug!("Set amount response: {:?}", res);
+        let status = res.status();
+        let body = res.text().await?;
+
+        if status != 200 {
+            debug!("Set amount response: {}", body);
             bail!(TransferError::SetAmountFailed);
         }
+
+        log_flow_step("set transfer amount", &body);
 
         Ok(())
     }
@@ -247,10 +262,15 @@ impl BoursoWebClient {
             .send()
             .await?;
 
-        if res.status() != 200 {
-            debug!("Submit transfer response: {:?}", res);
+        let status = res.status();
+        let body = res.text().await?;
+
+        if status != 200 {
+            debug!("Submit transfer response: {}", body);
             bail!(TransferError::Step5Failed);
         }
+
+        log_flow_step("submit step 5", &body);
 
         Ok(())
     }
@@ -283,10 +303,15 @@ impl BoursoWebClient {
 
         let res = self.client.post(&url).multipart(data).send().await?;
 
-        if res.status() != 200 {
-            debug!("Set reason response: {:?}", res);
+        let status = res.status();
+        let body = res.text().await?;
+
+        if status != 200 {
+            debug!("Set reason response: {}", body);
             bail!(TransferError::SetReasonFailed);
         }
+
+        log_flow_step("set transfer reason", &body);
 
         Ok(())
     }
@@ -319,19 +344,30 @@ impl BoursoWebClient {
             .send()
             .await?;
 
-        if res.status() != 200 {
-            debug!("Confirm transfer response: {:?}", res);
+        let status = res.status();
+        let body = res.text().await?;
+
+        if status != 200 {
+            debug!("Confirm transfer response: {}", body);
             bail!(TransferError::SubmitTransferFailed);
         }
 
-        let body = res.text().await?;
-
         if body.as_str().contains("Confirmation") {
-            Ok(())
-        } else {
-            debug!("Cannot find confirmation message in response {:?}", body);
-            bail!(TransferError::InvalidTransfer);
+            return Ok(());
         }
+
+        // A rejected submission comes back as the same form re-rendered, with a 200
+        // status. Reporting which step the server is still on says far more than a
+        // missing confirmation message.
+        match extract_flow_step(&body) {
+            Some(step) => debug!(
+                "Transfer not confirmed: the server is still on flow step {}",
+                step
+            ),
+            None => debug!("Cannot find confirmation message in response {}", body),
+        }
+
+        bail!(TransferError::InvalidTransfer);
     }
 
     /// Transfer funds from one account to another, yielding progress updates
@@ -470,5 +506,53 @@ impl BoursoWebClient {
 
             yield Ok(TransferProgress::Completed);
         }
+    }
+}
+
+/// Extract the step number the server reports in the flow form it returns.
+///
+/// # Arguments
+///
+/// * `body` - The HTML response of a transfer step.
+///
+/// # Returns
+///
+/// The step number as a string, or `None` when the response carries no flow form.
+fn extract_flow_step(body: &str) -> Option<String> {
+    let re = regex::Regex::new(r#"name="flow_ImmediateCashTransfer_step"\s*value="(?P<step>\d+)""#)
+        .unwrap();
+
+    re.captures(body)
+        .and_then(|captures| captures.name("step"))
+        .map(|step| step.as_str().to_string())
+}
+
+/// Log the step the server reports after a submission.
+///
+/// Each step only checks the HTTP status, but a submission the server rejects is
+/// re-rendered with status 200, so the flow can silently stall on a step instead of
+/// advancing. Logging the reported step makes that visible in `~/.bourso/bourso.log`.
+#[cfg(not(tarpaulin_include))]
+fn log_flow_step(label: &str, body: &str) {
+    match extract_flow_step(body) {
+        Some(step) => debug!("After '{}', the server reports flow step {}", label, step),
+        None => debug!("After '{}', the response carries no flow step", label),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_flow_step() {
+        let body = r#"<input  id="form_flow_ImmediateCashTransfer_step" type="hidden" class="c-field__input" name="flow_ImmediateCashTransfer_step" value="9" >"#;
+
+        assert_eq!(extract_flow_step(body), Some("9".to_string()));
+    }
+
+    #[test]
+    fn test_extract_flow_step_absent() {
+        assert_eq!(extract_flow_step("<html><body>Confirmation</body></html>"), None);
     }
 }
