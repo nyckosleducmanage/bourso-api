@@ -7,6 +7,11 @@ use tracing::debug;
 
 mod error;
 
+/// `Characteristics[paymentType]` value for an instant transfer, credited in seconds.
+/// The other value the form offers is "1", a classic transfer settling in 1 to 3
+/// business days.
+const PAYMENT_TYPE_INSTANT: &str = "0";
+
 #[derive(Debug, Clone)]
 pub enum TransferProgress {
     Validating,
@@ -15,8 +20,9 @@ pub enum TransferProgress {
     SettingDebitAccount,
     SettingCreditAccount,
     SettingAmount,
-    SubmittingStep5,
+    AcknowledgingPayeeVerification,
     SettingReason,
+    SubmittingRecap,
     ConfirmingTransfer,
     Completed,
 }
@@ -31,15 +37,16 @@ impl TransferProgress {
             TransferProgress::SettingDebitAccount => 4,
             TransferProgress::SettingCreditAccount => 5,
             TransferProgress::SettingAmount => 6,
-            TransferProgress::SubmittingStep5 => 7,
+            TransferProgress::AcknowledgingPayeeVerification => 7,
             TransferProgress::SettingReason => 8,
-            TransferProgress::ConfirmingTransfer => 9,
-            TransferProgress::Completed => 10,
+            TransferProgress::SubmittingRecap => 9,
+            TransferProgress::ConfirmingTransfer => 10,
+            TransferProgress::Completed => 11,
         }
     }
 
     pub fn total_steps() -> u8 {
-        10
+        11
     }
 
     #[cfg(not(tarpaulin_include))]
@@ -51,8 +58,11 @@ impl TransferProgress {
             TransferProgress::SettingDebitAccount => "Setting debit account",
             TransferProgress::SettingCreditAccount => "Setting credit account",
             TransferProgress::SettingAmount => "Setting transfer amount",
-            TransferProgress::SubmittingStep5 => "Submitting intermediate step",
+            TransferProgress::AcknowledgingPayeeVerification => {
+                "Acknowledging the payee verification"
+            }
             TransferProgress::SettingReason => "Setting transfer reason",
+            TransferProgress::SubmittingRecap => "Submitting the recap",
             TransferProgress::ConfirmingTransfer => "Confirming transfer",
             TransferProgress::Completed => "Transfer completed",
         }
@@ -159,15 +169,12 @@ impl BoursoWebClient {
         to_account: &str,
         transfer_id: &str,
         flow_instance: &str,
-        transfer_from_banking: bool,
+        _transfer_from_banking: bool,
     ) -> Result<()> {
-        let form = if transfer_from_banking {
-            reqwest::multipart::Form::new().text("CreditAccount[newBeneficiary]", "0".to_string())
-        } else {
-            reqwest::multipart::Form::new()
-        };
-
-        let data = form
+        // The form only exposes CreditAccount[credit]; the CreditAccount[newBeneficiary]
+        // field it used to carry is gone, and Symfony rejects a form that carries an
+        // extra field, which stalled this step on the account picker.
+        let data = reqwest::multipart::Form::new()
             .text(
                 "flow_ImmediateCashTransfer_instance",
                 flow_instance.to_string(),
@@ -234,7 +241,10 @@ impl BoursoWebClient {
         Ok(())
     }
 
-    /// Submit step 5
+    /// Acknowledge the Verification of Payee result (step 4)
+    ///
+    /// SEPA payee verification became a mandatory step of the flow; the form carries
+    /// no field of its own, acknowledging it is just a submit.
     #[cfg(not(tarpaulin_include))]
     async fn submit_step_5(
         &self,
@@ -275,7 +285,10 @@ impl BoursoWebClient {
         Ok(())
     }
 
-    /// Set the transfer reason (step 8)
+    /// Set the transfer reason and payment type (step 7)
+    ///
+    /// The form asks for `Characteristics[paymentType]`, which is required; the
+    /// `Characteristics[schedulingType]` field this used to send no longer exists.
     #[cfg(not(tarpaulin_include))]
     async fn set_transfer_reason(
         &self,
@@ -289,15 +302,15 @@ impl BoursoWebClient {
                 "flow_ImmediateCashTransfer_instance",
                 flow_instance.to_string(),
             )
-            .text("flow_ImmediateCashTransfer_step", "7".to_string())
+            .text("flow_ImmediateCashTransfer_step", "6".to_string())
             .text("Characteristics[label]", transfer_reason.to_string())
-            .text("Characteristics[schedulingType]", "1".to_string()) // 1 = unique
+            .text("Characteristics[paymentType]", PAYMENT_TYPE_INSTANT.to_string())
             .text("flow_ImmediateCashTransfer_transition", "".to_string())
             .text("flow_ImmediateCashTransfer_transition", "".to_string())
             .text("submit", "".to_string());
 
         let url = format!(
-            "{}/compte/cav/{}/virements/immediat/nouveau/{}/8",
+            "{}/compte/cav/{}/virements/immediat/nouveau/{}/7",
             BASE_URL, from_account, transfer_id
         );
 
@@ -316,7 +329,56 @@ impl BoursoWebClient {
         Ok(())
     }
 
-    /// Confirm and finalize the transfer (step 10)
+    /// Validate the recap screen (step 8)
+    ///
+    /// Between the characteristics and the final confirmation the flow shows a recap
+    /// with a single "Valider" button. It carries no field of its own.
+    ///
+    /// # Returns
+    ///
+    /// `true` when this submission already reached the confirmation screen, which is
+    /// what the flow does today: validating the recap executes the transfer.
+    #[cfg(not(tarpaulin_include))]
+    async fn submit_recap(
+        &self,
+        from_account: &str,
+        transfer_id: &str,
+        flow_instance: &str,
+    ) -> Result<bool> {
+        let data = reqwest::multipart::Form::new()
+            .text(
+                "flow_ImmediateCashTransfer_instance",
+                flow_instance.to_string(),
+            )
+            .text("flow_ImmediateCashTransfer_step", "8".to_string())
+            .text("flow_ImmediateCashTransfer_transition", "".to_string())
+            .text("flow_ImmediateCashTransfer_transition", "".to_string())
+            .text("submit", "".to_string());
+
+        let res = self
+            .client
+            .post(format!(
+                "{}/compte/cav/{}/virements/immediat/nouveau/{}/9",
+                BASE_URL, from_account, transfer_id
+            ))
+            .multipart(data)
+            .send()
+            .await?;
+
+        let status = res.status();
+        let body = res.text().await?;
+
+        if status != 200 {
+            debug!("Submit recap response: {}", body);
+            bail!(TransferError::SubmitTransferFailed);
+        }
+
+        log_flow_step("submit recap", &body);
+
+        Ok(is_confirmation_page(&body))
+    }
+
+    /// Confirm and finalize the transfer (step 9)
     #[cfg(not(tarpaulin_include))]
     async fn confirm_transfer(
         &self,
@@ -352,20 +414,18 @@ impl BoursoWebClient {
             bail!(TransferError::SubmitTransferFailed);
         }
 
-        if body.as_str().contains("Confirmation") {
+        if is_confirmation_page(&body) {
             return Ok(());
         }
 
         // A rejected submission comes back as the same form re-rendered, with a 200
         // status. Reporting which step the server is still on says far more than a
         // missing confirmation message.
-        match extract_flow_step(&body) {
-            Some(step) => debug!(
-                "Transfer not confirmed: the server is still on flow step {}",
-                step
-            ),
-            None => debug!("Cannot find confirmation message in response {}", body),
-        }
+        log_flow_step("confirm transfer", &body);
+
+        // This is the failure path, so the page is always worth keeping whatever the
+        // debug flag says: it is the only record of why the transfer was refused.
+        debug!("Transfer not confirmed, full response: {}", body);
 
         bail!(TransferError::InvalidTransfer);
     }
@@ -475,15 +535,15 @@ impl BoursoWebClient {
                 return;
             }
 
-            // Step 5: Submit
-            yield Ok(TransferProgress::SubmittingStep5);
+            // Step 4: Acknowledge the SEPA payee verification
+            yield Ok(TransferProgress::AcknowledgingPayeeVerification);
             if let Err(e) = self.submit_step_5(&from_account_id, &transfer_id, &flow_instance)
                 .await {
                 yield Err(e);
                 return;
             }
 
-            // Step 10: Set reason
+            // Step 6: Set reason and payment type
             yield Ok(TransferProgress::SettingReason);
             if let Err(e) = self.set_transfer_reason(
                 &from_account_id,
@@ -496,17 +556,43 @@ impl BoursoWebClient {
                 return;
             }
 
-            // Step 12: Confirm transfer
-            yield Ok(TransferProgress::ConfirmingTransfer);
-            if let Err(e) = self.confirm_transfer(&from_account_id, &transfer_id, &flow_instance)
+            // Step 8: Validate the recap. This is what executes the transfer today, so
+            // it can land straight on the confirmation screen.
+            yield Ok(TransferProgress::SubmittingRecap);
+            let already_confirmed = match self.submit_recap(&from_account_id, &transfer_id, &flow_instance)
                 .await {
-                yield Err(e);
-                return;
+                Ok(confirmed) => confirmed,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            // Only submit the final step when the recap did not already confirm:
+            // posting it again on a finished flow answers with no confirmation at all,
+            // which used to be reported as a failed transfer that had in fact gone through.
+            if !already_confirmed {
+                yield Ok(TransferProgress::ConfirmingTransfer);
+                if let Err(e) = self.confirm_transfer(&from_account_id, &transfer_id, &flow_instance)
+                    .await {
+                    yield Err(e);
+                    return;
+                }
             }
 
             yield Ok(TransferProgress::Completed);
         }
     }
+}
+
+/// Whether a response is the confirmation screen that ends the flow.
+///
+/// Deliberately conservative: it requires both that the flow form is gone and that a
+/// success marker is present. A re-rendered form is never a success, and mistaking a
+/// refusal for a confirmation is far worse than the opposite.
+fn is_confirmation_page(body: &str) -> bool {
+    extract_flow_step(body).is_none()
+        && (body.contains("c-alert--success") || body.contains(">Confirmation</h3>"))
 }
 
 /// Extract the step number the server reports in the flow form it returns.
@@ -537,6 +623,13 @@ fn log_flow_step(label: &str, body: &str) {
     match extract_flow_step(body) {
         Some(step) => debug!("After '{}', the server reports flow step {}", label, step),
         None => debug!("After '{}', the response carries no flow step", label),
+    }
+
+    // The step number says that a submission was refused, never why. Set
+    // BOURSO_DEBUG_TRANSFER=1 to also capture each page in ~/.bourso/bourso.log,
+    // which is what it takes to see the fields the form actually expects.
+    if std::env::var("BOURSO_DEBUG_TRANSFER").is_ok() {
+        debug!("Body after '{}': {}", label, body);
     }
 }
 
