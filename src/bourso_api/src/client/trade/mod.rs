@@ -61,18 +61,14 @@ fn get_trading_summary_url(config: &Config, account: Account) -> Result<String> 
     )
 }
 
-fn get_trading_is_first_order_url(config: &Config) -> Result<String> {
-    Ok(format!(
-        "{}/order/isfirstorder?_host=tradingboard.boursobank.com",
-        get_trading_base_url(config)?
-    ))
-}
-
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TradingSummaryItem {
     /// Either "account" or "positions"
     pub id: String,
+    /// Will be Some if TradingSummaryItem is of id "account"
+    pub account: Option<AccountSummary>,
+    /// Will be Some if TradingSummaryItem is of id "positions"
     pub positions: Option<Vec<PositionSummary>>,
 }
 
@@ -122,5 +118,5 @@ pub struct AccountSummary {
     pub gain_loss_percent: SummaryValue,
     pub liquidation_amount: SummaryValue,
     /// Cash deposited
-    pub contribution: i64,
+    pub contribution: f64,
 }

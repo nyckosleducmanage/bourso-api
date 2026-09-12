@@ -1,30 +1,21 @@
 use anyhow::Result;
 use bourso_api::client::trade::order::OrderSide;
-use clap::{builder::{PossibleValue, ValueParser}, Arg, Command};
-
-use log::debug;
-use validate::validate_account_id;
-
-use crate::settings::init_logger;
-
-mod settings;
-mod validate;
+use bourso_cli::{settings::init_logger, validate::validate_account_id};
+use clap::{
+    builder::{PossibleValue, ValueParser},
+    Arg, Command,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
-    debug!("Version: {:?}", VERSION);
 
     init_logger()?;
 
     let account_arg = Arg::new("account")
         .short('a')
         .long("account")
-        .help(
-            r#"The account to use by its 'id' (e.g: 'e51f635524a7d506e4d4a7a8088b6278').
-    You can get this info with the command `bourso accounts`"#
-        )
-        .default_value("PEA")
+        .help("The account to use by its 'id' (e.g: 'e51f635524a7d506e4d4a7a8088b6278'). You can get this info with the command `bourso accounts`")
         .value_parser(clap::value_parser!(String)) // Enforce input as String
         .value_parser(ValueParser::new(validate_account_id))
         .required(true);
@@ -186,10 +177,85 @@ async fn main() -> Result<()> {
                         .about("Get the last value of the stock. Sets the `length` to 1 day and `interval` to 0")
                 )
         )
+        .subcommand(
+            Command::new("export")
+                .about("Export data from your BoursoBank account")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("transactions")
+                        .about("Export transactions for a given account over a date range")
+                        .arg(account_arg.clone())
+                        .arg(
+                            Arg::new("start-date")
+                                .long("start-date")
+                                .help("Start date for transactions (DD/MM/YYYY)")
+                                .required(true)
+                        )
+                        .arg(
+                            Arg::new("end-date")
+                                .long("end-date")
+                                .help("End date for transactions (DD/MM/YYYY)")
+                                .required(true)
+                        )
+                        .arg(
+                            Arg::new("format")
+                                .long("format")
+                                .short('f')
+                                .help("Output format (csv or json)")
+                                .default_value("csv")
+                                .value_parser(["csv", "json"])
+                        )
+                        .arg(
+                            Arg::new("output")
+                                .long("output")
+                                .short('o')
+                                .help("Output file path (defaults to stdout)")
+                                .required(false)
+                        )
+                )
+        )
+        .subcommand(
+            Command::new("transfer")
+                .about("Make a transfer between your accounts")
+                .arg(account_arg.clone())
+                .arg(
+                    Arg::new("to_account")
+                        .long("to")
+                        .help(
+                            r#"The destination account id as an hexadecimal string (32 characters).
+    You can get this info with the command `bourso accounts`"#
+                        )
+                        .required(true)
+                )
+                .arg(
+                    Arg::new("amount")
+                        .long("amount")
+                        .help("The amount to transfer")
+                        .required(true)
+                )
+                .arg(
+                    Arg::new("reason")
+                        .long("reason")
+                        .help("The reason for the transfer (max 50 characters)")
+                        .required(false)
+                )
+        )
         .arg(
             Arg::new("credentials")
                 .long("credentials")
                 .help("The path to the credentials file")
+                .value_parser(clap::value_parser!(String))
+                .required(false)
+        )
+        .arg(
+            Arg::new("identity")
+                .long("identity")
+                .help(
+                    r#"Which identity to use when your login gives access to several
+    (e.g. a personal and a professional space sharing one customer id).
+    Accepts a 1-based index or part of the identity label. Omit it once to list them."#
+                )
                 .value_parser(clap::value_parser!(String))
                 .required(false)
         )

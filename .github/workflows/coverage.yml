@@ -1,6 +1,11 @@
 name: coverage
 
 on: [push]
+
+# Coverage only reads the code and uploads to codecov, it never writes back.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: coverage

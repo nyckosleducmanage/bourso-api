@@ -1,23 +1,93 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bourso_api::{
-    account::{Account, AccountKind},
+    account::{Account, AccountKind, Transaction},
     client::{
         trade::{order::OrderSide, tick::QuoteTab},
-        BoursoWebClient,
+        transfer::TransferProgress,
+        BoursoWebClient, Identity,
     },
     get_client,
 };
 use clap::ArgMatches;
-use log::{info, warn};
+use futures_util::{pin_mut, StreamExt};
+use tracing::{debug, info, warn};
 
-mod settings;
+pub mod qrcode;
+pub mod settings;
+pub mod validate;
+
 use settings::{get_settings, save_settings, Settings};
-mod validate;
+
+/// Pick the identity to use among those reachable behind the login.
+///
+/// # Arguments
+///
+/// * `identities` - The identities available, as listed by the website.
+/// * `requested` - The `--identity` value: a 1-based index or part of a label.
+///
+/// # Returns
+///
+/// The selected identity, or an error listing the available ones when the request
+/// is missing or ambiguous.
+#[cfg(not(tarpaulin_include))]
+fn select_identity(identities: &[Identity], requested: Option<&str>) -> Result<Identity> {
+    // Nothing to choose from
+    if identities.len() == 1 {
+        return Ok(identities[0].clone());
+    }
+
+    if let Some(requested) = requested {
+        // A 1-based index takes precedence, as labels are only best-effort
+        if let Ok(index) = requested.parse::<usize>() {
+            if index >= 1 && index <= identities.len() {
+                return Ok(identities[index - 1].clone());
+            }
+
+            bail!(
+                "Identity index {} is out of range, this login has {} identities",
+                index,
+                identities.len()
+            );
+        }
+
+        let needle = requested.to_lowercase();
+        let matched = identities
+            .iter()
+            .filter(|identity| identity.label.to_lowercase().contains(&needle))
+            .collect::<Vec<_>>();
+
+        if matched.len() == 1 {
+            return Ok(matched[0].clone());
+        }
+
+        if matched.len() > 1 {
+            bail!(
+                "'{}' matches {} identities, use the index instead",
+                requested,
+                matched.len()
+            );
+        }
+
+        warn!("No identity matches '{}'.", requested);
+    }
+
+    warn!("This login gives access to several identities:");
+    for (index, identity) in identities.iter().enumerate() {
+        let label = if identity.label.is_empty() {
+            "(label not found)"
+        } else {
+            identity.label.as_str()
+        };
+        // Show a hash prefix so identities can be told apart even without a label
+        let hash_prefix = &identity.hash[..8.min(identity.hash.len())];
+        warn!("  {}. {} [{}…]", index + 1, label, hash_prefix);
+    }
+
+    bail!("Select one with --identity <index|label>, e.g. `--identity 1` (before the subcommand)")
+}
 
 #[cfg(not(tarpaulin_include))]
 pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
-    use log::debug;
-
     let settings = match matches.get_one::<String>("credentials") {
         Some(credentials_path) => Settings::load(credentials_path)?,
         None => get_settings()?,
@@ -68,16 +138,20 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
 
             match quote_matches.subcommand() {
                 Some(("highest", _)) => {
-                    info!("Highest quote: {:#?}", quotes.d.get_highest_value());
+                    let highest_quote = quotes.d.get_highest_value();
+                    info!(highest_quote, "Highest quote: {:#?}", highest_quote);
                 }
                 Some(("lowest", _)) => {
-                    info!("Lowest quote: {:#?}", quotes.d.get_lowest_value());
+                    let lowest_quote = quotes.d.get_lowest_value();
+                    info!(lowest_quote, "Lowest quote: {:#?}", lowest_quote);
                 }
                 Some(("volume", _)) => {
-                    info!("Volume: {:#?}", quotes.d.get_volume());
+                    let volume = quotes.d.get_volume();
+                    info!(volume, "Volume: {:#?}", volume);
                 }
                 Some(("average", _)) => {
-                    info!("Average quote: {:#?}", quotes.d.get_average_value());
+                    let average_quote = quotes.d.get_average_value();
+                    info!(average_quote, "Average quote: {:#?}", average_quote);
                 }
                 Some(("last", _)) => {
                     let quote: QuoteTab;
@@ -90,7 +164,8 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                     }
 
                     info!(
-                        "Last quote: current: {}, open: {}, high: {}, low: {}, volume: {}",
+                        close = quote.close, open = quote.open, high = quote.high, low = quote.low, volume = quote.volume,
+                        "Last quote: current: {:#?}, open: {:#?}, high: {:#?}, low: {:#?}, volume: {:#?}",
                         quote.close, quote.open, quote.high, quote.low, quote.volume
                     );
                 }
@@ -98,13 +173,9 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                     info!("Quotes:");
                     for quote in quotes.d.quote_tab.iter() {
                         info!(
-                            "Quote day {}: Close: {}, Open: {}, High: {}, Low: {}, Volume: {}",
-                            quote.date,
-                            quote.close,
-                            quote.open,
-                            quote.high,
-                            quote.low,
-                            quote.volume
+                            date = quote.date, close = quote.close, open = quote.open, high = quote.high, low = quote.low, volume = quote.volume,
+                            "Quote day {:#?}: Close: {:#?}, Open: {:#?}, High: {:#?}, Low: {:#?}, Volume: {:#?}",
+                            quote.date, quote.close, quote.open, quote.high, quote.low, quote.volume,
                         );
                     }
                 }
@@ -114,9 +185,10 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
         }
         // These matches require authentication
         Some(("accounts", _))
-        | Some(("transactions", _))
+        | Some(("export", _))
         | Some(("balance", _))
-        | Some(("trade", _)) => (),
+        | Some(("trade", _))
+        | Some(("transfer", _)) => (),
         _ => unreachable!(),
     }
 
@@ -145,44 +217,83 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
 
     let mut web_client: BoursoWebClient = get_client();
     web_client.init_session().await?;
+    // Set when the password step succeeded but an identity still has to be picked
+    let mut identity_pending = false;
+    // Set when we went through the MFA flow, which can also end on the identity chooser
+    let mut came_through_mfa = false;
     match web_client.login(&customer_id, &password).await {
         Ok(_) => {
             info!("Login successful ✅");
         }
         Err(e) => match e.downcast_ref() {
+            Some(bourso_api::client::error::ClientError::IdentitySelectionRequired) => {
+                identity_pending = true;
+            }
             Some(bourso_api::client::error::ClientError::MfaRequired) => {
-                let mut mfa_required = true;
-                let mut mfa_count = 0;
-                while mfa_required {
-                    if mfa_count == 2 {
-                        warn!("MFA thresold reached. Trying to login again by reinitalizing the session.");
-                        web_client = get_client();
-                        web_client.init_session().await?;
-                        match web_client.login(&customer_id, &password).await {
-                            Ok(_) => {
-                                info!("Login successful ✅");
+                came_through_mfa = true;
+                warn!("An MFA is required.");
+
+                let (otp_id, form_state, token, mfa_type) = match web_client.request_mfa().await {
+                    Ok(mfa_info) => mfa_info,
+                    Err(e) => {
+                        debug!("{:#?}", e);
+                        return Err(e);
+                    }
+                };
+                info!("To validate your identity, please open the BoursoBank app and validate the login request.");
+
+                // Loop until MFA is ready, timeout after 5 minutes
+                let mut wait_time = 0;
+                let wait_interval = 5;
+                let max_wait_time = 300;
+                loop {
+                    info!(
+                        "Checking MFA status... (waited {}s/{})",
+                        wait_time, max_wait_time
+                    );
+                    match web_client
+                        .check_mfa(
+                            mfa_type.clone(),
+                            otp_id.clone(),
+                            form_state.clone(),
+                            token.clone(),
+                        )
+                        .await
+                    {
+                        Ok(mfa_validated) => {
+                            if mfa_validated {
                                 break;
                             }
-                            Err(e) => {
-                                debug!("{:#?}", e);
-                                return Err(e);
-                            }
-                        }
-                    }
-                    warn!("An MFA is required.");
 
-                    let (otp_id, token, mfa_type) = web_client.request_mfa().await?;
-                    let code = rpassword::prompt_password("Enter your MFA code: ")
-                        .context("Failed to read MFA code")?
-                        .trim()
-                        .to_string();
-                    match web_client.submit_mfa(mfa_type, otp_id, code, token).await {
-                        Ok(_) => {
-                            mfa_required = false;
+                            if wait_time >= max_wait_time {
+                                return Err(anyhow::anyhow!(
+                                    "MFA validation timed out after {} seconds",
+                                    max_wait_time
+                                ));
+                            }
+
+                            wait_time += wait_interval;
+                            tokio::time::sleep(std::time::Duration::from_secs(wait_interval)).await;
                         }
                         Err(e) => match e.downcast_ref() {
-                            Some(bourso_api::client::error::ClientError::MfaRequired) => {
-                                mfa_count += 1;
+                            Some(bourso_api::client::error::ClientError::QRCodeRequired(code)) => {
+                                match qrcode::generate_qr_code(code) {
+                                    Ok(qr) => {
+                                        println!();
+                                        println!("{}", qrcode::render_to_terminal(&qr));
+                                        println!();
+                                    }
+                                    Err(e) => {
+                                        debug!("{:#?}", e);
+                                        return Err(e);
+                                    }
+                                }
+                                info!(
+                                    "Please scan the latest QR code in your BoursoBank app to validate the login request."
+                                );
+                                wait_time += wait_interval;
+                                tokio::time::sleep(std::time::Duration::from_secs(wait_interval))
+                                    .await;
                             }
                             _ => {
                                 debug!("{:#?}", e);
@@ -199,6 +310,26 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                 return Err(e);
             }
         },
+    }
+
+    // Logins that give access to several identities (e.g. a personal and a
+    // professional space) land on an identity chooser: the session is not usable
+    // until one is selected. The MFA flow can end there too, so probe in that case.
+    if identity_pending || (came_through_mfa && web_client.is_identity_selection_pending().await?) {
+        let identities = web_client.list_identities().await?;
+        let requested = matches.get_one::<String>("identity").map(|s| s.as_str());
+        let identity = select_identity(&identities, requested)?;
+
+        info!(
+            "Selecting identity: {}",
+            if identity.label.is_empty() {
+                identity.hash.as_str()
+            } else {
+                identity.label.as_str()
+            }
+        );
+
+        web_client.switch_identity(&identity).await?;
     }
 
     let accounts: Vec<Account>;
@@ -221,6 +352,80 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
             println!("{:#?}", accounts);
         }
 
+        Some(("export", export_matches)) => {
+            match export_matches.subcommand() {
+                Some(("transactions", tx_matches)) => {
+                    let account_id = tx_matches
+                        .get_one::<String>("account")
+                        .map(|s| s.as_str())
+                        .unwrap();
+                    let start_date = tx_matches
+                        .get_one::<String>("start-date")
+                        .map(|s| s.as_str())
+                        .unwrap();
+                    let end_date = tx_matches
+                        .get_one::<String>("end-date")
+                        .map(|s| s.as_str())
+                        .unwrap();
+                    let format = tx_matches
+                        .get_one::<String>("format")
+                        .map(|s| s.as_str())
+                        .unwrap();
+                    let output_path = tx_matches
+                        .get_one::<String>("output")
+                        .map(|s| s.as_str());
+
+                    info!(
+                        "Fetching transactions for account {} from {} to {}...",
+                        account_id, start_date, end_date
+                    );
+
+                    let transactions: Vec<Transaction> = web_client
+                        .get_transactions(account_id, start_date, end_date)
+                        .await?;
+
+                    info!("Found {} transactions", transactions.len());
+
+                    let content = match format {
+                        "json" => serde_json::to_string_pretty(&transactions)?,
+                        _ => {
+                            let mut lines = vec![
+                                "dateOp;dateVal;label;category;categoryParent;supplierFound;amount;comment;accountNum;accountLabel;accountbalance".to_string()
+                            ];
+                            for tx in &transactions {
+                                lines.push(format!(
+                                    "{};{};{};{};{};{};{};{};{};{};{}",
+                                    tx.date_op,
+                                    tx.date_val,
+                                    tx.label,
+                                    tx.category,
+                                    tx.category_parent,
+                                    tx.supplier_found,
+                                    format!("{:.2}", tx.amount),
+                                    tx.comment,
+                                    tx.account_num,
+                                    tx.account_label,
+                                    format!("{:.2}", tx.account_balance),
+                                ));
+                            }
+                            lines.join("\n")
+                        }
+                    };
+
+                    match output_path {
+                        Some(path) => {
+                            std::fs::write(path, &content)?;
+                            info!("Transactions exported to {}", path);
+                        }
+                        None => {
+                            println!("{}", content);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
         Some(("trade", trade_matches)) => {
             accounts = web_client.get_accounts(Some(AccountKind::Trading)).await?;
 
@@ -233,6 +438,7 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                                 .map(|s| s.as_str())
                                 .unwrap();
 
+                            // Get account from previously fetched accounts
                             let account = accounts
                                 .iter()
                                 .find(|a| a.id == account_id)
@@ -252,8 +458,8 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                         _ => unreachable!(),
                     }
                 }
-                Some(("position", symbols_matches)) => {
-                    match symbols_matches.subcommand() {
+                Some(("position", position_matches)) => {
+                    match position_matches.subcommand() {
                         Some(("list", list_matches)) => {
                             let account_id = list_matches
                                 .get_one::<String>("account")
@@ -266,6 +472,29 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                                 .context("Account not found. Are you sure you have access to it? Run `bourso accounts` to list your accounts")?;
 
                             let summary = web_client.get_trading_summary(account.clone()).await?;
+
+                            // The endpoint returns an "account" item (cash, valuation)
+                            // alongside the "positions" item
+                            for item in summary.iter() {
+                                if let Some(account_summary) = item.account.as_ref() {
+                                    let currency = account_summary
+                                        .cash
+                                        .currency
+                                        .as_deref()
+                                        .unwrap_or(account_summary.currency.as_str());
+
+                                    info!(
+                                        "{}: cash {} {}, positions {} {}, total {} {}",
+                                        account_summary.name,
+                                        account_summary.cash.value,
+                                        currency,
+                                        account_summary.valuation.value,
+                                        currency,
+                                        account_summary.total.value,
+                                        currency
+                                    );
+                                }
+                            }
 
                             let total_positions = summary
                                 .iter()
@@ -295,6 +524,80 @@ pub async fn parse_matches(matches: ArgMatches) -> Result<()> {
                 _ => unreachable!(),
             }
         }
+
+        Some(("transfer", transfer_matches)) => {
+            accounts = web_client.get_accounts(None).await?;
+
+            let from_account_id = transfer_matches
+                .get_one::<String>("account")
+                .map(|s| s.as_str())
+                .unwrap();
+            let to_account_id = transfer_matches
+                .get_one::<String>("to_account")
+                .map(|s| s.as_str())
+                .unwrap();
+            let amount = transfer_matches
+                .get_one::<String>("amount")
+                .map(|s| s.parse::<f64>().unwrap())
+                .unwrap();
+            let reason = transfer_matches
+                .get_one::<String>("reason")
+                .map(|s| s.as_str());
+
+            // Get from_account from previously fetched accounts
+            let from_account = accounts
+                .iter()
+                .find(|a| a.id == from_account_id)
+                .context("From account not found. Are you sure you have access to it? Run `bourso accounts` to list your accounts")?;
+
+            // Get to_account from previously fetched accounts
+            let to_account = accounts
+                .iter()
+                .find(|a| a.id == to_account_id)
+                .context("To account not found. Are you sure you have access to it? Run `bourso accounts` to list your accounts")?;
+
+            let stream = web_client.transfer_funds(
+                amount,
+                from_account.clone(),
+                to_account.clone(),
+                reason.map(|s| s.to_string()),
+            );
+
+            pin_mut!(stream);
+
+            // Track progress and update display
+            while let Some(progress_result) = stream.next().await {
+                let progress = progress_result?;
+                let step = progress.step_number();
+                let total = TransferProgress::total_steps();
+                let percentage = (step as f32 / total as f32 * 100.0) as u8;
+
+                // Create a simple progress bar
+                let bar_length = 30;
+                let filled = (bar_length as f32 * step as f32 / total as f32) as usize;
+                let bar: String = "█".repeat(filled) + &"░".repeat(bar_length - filled);
+
+                // Use ANSI escape code to clear the line before printing
+                // \x1B[2K clears the entire line, \r returns cursor to start
+                print!(
+                    "\x1B[2K\r[{}] {:3}% - {}/{} - {}",
+                    bar,
+                    percentage,
+                    step,
+                    total,
+                    progress.description()
+                );
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+            }
+            println!(); // New line after progress is complete
+
+            info!(
+                "Transfer of {} from account {} to account {} successful ✅",
+                amount, from_account.id, to_account.id
+            );
+        }
+
         _ => unreachable!(),
     }
 

@@ -1,10 +1,8 @@
+use anyhow::{Context, Result};
+use directories::UserDirs;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::prelude::*;
-use anyhow::{Result, Context};
-use directories::UserDirs;
-use log::LevelFilter;
-use serde::{Serialize, Deserialize};
-use log4rs::{append::{console::{ConsoleAppender, Target}, file::FileAppender}, config::{Appender, Root}, encode::pattern::PatternEncoder, filter::threshold::ThresholdFilter, Config};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Settings {
@@ -21,11 +19,15 @@ impl Settings {
             Ok(data) => data,
             Err(_) => {
                 return Err(anyhow::anyhow!("Failed to read settings file"));
-            },
+            }
         };
 
-        let settings: Settings = serde_json::from_str(&file_content)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize settings: {}\nPlease make sure the settings file is valid.", e))?;
+        let settings: Settings = serde_json::from_str(&file_content).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to deserialize settings: {}\nPlease make sure the settings file is valid.",
+                e
+            )
+        })?;
 
         Ok(settings)
     }
@@ -40,13 +42,23 @@ pub fn get_settings() -> Result<Settings> {
         Ok(data) => data,
         Err(_) => {
             // Create the settings file if it doesn't exist
-            save_settings(&Settings { customer_id: None, password: None })?;
-            return Ok(Settings { customer_id: None, password: None });
-        },
+            save_settings(&Settings {
+                customer_id: None,
+                password: None,
+            })?;
+            return Ok(Settings {
+                customer_id: None,
+                password: None,
+            });
+        }
     };
 
-    let settings: Settings = serde_json::from_str(&file_content)
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize settings: {}\nPlease make sure the settings file is valid.", e))?;
+    let settings: Settings = serde_json::from_str(&file_content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to deserialize settings: {}\nPlease make sure the settings file is valid.",
+            e
+        )
+    })?;
     Ok(settings)
 }
 
@@ -61,96 +73,64 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
     path = path.join("settings.json");
     let mut file = fs::File::create(&path).context("Failed to create settings file")?;
     let json = serde_json::to_string_pretty(settings).context("Failed to serialize settings")?;
-    file.write_all(json.as_bytes()).context("Failed to write settings file")?;
+    file.write_all(json.as_bytes())
+        .context("Failed to write settings file")?;
     Ok(())
 }
 
-#[cfg(not(tarpaulin_include))]
 pub fn init_logger() -> Result<()> {
-    use std::env;
+    use std::io::IsTerminal;
+    use std::{fs, io};
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    use log::debug;
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let log_level = match env::var("RUST_LOG") {
-        Ok(level) => match level.as_str() {
-            "trace" => LevelFilter::Trace,
-            "debug" => LevelFilter::Debug,
-            "info" => LevelFilter::Info,
-            "warn" => LevelFilter::Warn,
-            "error" => LevelFilter::Error,
-            _ => {
-                env::set_var("RUST_LOG", "info");
-                LevelFilter::Info
-            }
-        },
-        Err(_) => {
-            env::set_var("RUST_LOG", "info");
-            LevelFilter::Info
-        }
-    };
-
-    debug!("Log level: {:?}", log_level);
-
-    // Create the .bourso directory if it doesn't exist
+    // Create ~/.bourso/bourso.log if it doesn't exist
     let user_dirs = UserDirs::new().context("Failed to get user directories")?;
     let mut path = user_dirs.home_dir().to_path_buf();
-    path = path.join(".bourso");
-
+    path.push(".bourso");
     fs::create_dir_all(&path)?;
-    path = path.join("bourso.log");
+    path.push("bourso.log");
 
-    let stderr = ConsoleAppender::builder()
-        .target(Target::Stderr)
-        .encoder(Box::new(PatternEncoder::new("{h({l})}  {M} > {m}{n}")))
-        .build();
+    // Pretty console (stderr), filtered by RUST_LOG
+    let console_layer = fmt::layer()
+        .with_writer(io::stderr)
+        .with_ansi(IsTerminal::is_terminal(&io::stderr()))
+        .with_level(true)
+        .with_target(true)
+        .without_time()
+        .compact()
+        .fmt_fields({
+            fmt::format::debug_fn(move |writer, field, value| {
+                if field.name() == "message" {
+                    write!(writer, "{:?}", value)?;
+                }
+                Ok(())
+            })
+        })
+        .with_filter(env_filter.clone());
 
-    let logfile = FileAppender::builder()
-        .encoder(Box::new(PatternEncoder::new("{d} [{t}] {l} {M} > {m}{n}")))
-        .build(path)
-        .unwrap();
+    // JSON file (capture everything)
+    let log_path = path.clone();
+    let json_layer = fmt::layer()
+        .with_writer(move || {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .expect("open ~/.bourso/bourso.log")
+        })
+        .json()
+        .with_target(true)
+        .with_level(true)
+        .flatten_event(true)
+        .with_filter(LevelFilter::TRACE);
 
-    let config = Config::builder()
-        .appender(Appender::builder().build("logfile", Box::new(logfile)))
-        .appender(
-            Appender::builder()
-                .filter(Box::new(ThresholdFilter::new(log_level)))
-                .build("stderr", Box::new(stderr)),
-        )
-        .build(
-            Root::builder()
-                .appender("logfile")
-                .appender("stderr")
-                .build(LevelFilter::Trace),
-        )
-        .unwrap();
-    
-    log4rs::init_config(config)?;
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(json_layer)
+        .init();
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::env;
-
-    use log::LevelFilter;
-
-    #[test]
-    fn test_get_settings() {
-        let f = match env::var("RUST_LOG") {
-            Ok(level) => match level.as_str() {
-                "trace" => LevelFilter::Trace,
-                "debug" => LevelFilter::Debug,
-                "info" => LevelFilter::Info,
-                "warn" => LevelFilter::Warn,
-                "error" => LevelFilter::Error,
-                _ => LevelFilter::Info,
-            },
-            Err(_) => {
-                env::set_var("RUST_LOG", "info");
-                LevelFilter::Info
-            }
-        }; 
-        assert_eq!(f, LevelFilter::Info);
-    }
 }

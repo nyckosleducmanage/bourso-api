@@ -21,7 +21,10 @@ The first goal of this project was creating an automated [DCA (Dollar Cost Avera
   - [Get your accounts](#get-your-accounts) 
   - [Place an order](#place-an-order)
   - [Quote 🥷](#quote)
+  - [Transfer funds](#transfer-funds)
   - [DCA](#dca-dollar-cost-averaging-investing)
+- [Contributors](#contributors)
+- [Contributing](#contributing)
 - [Security](#security)
 - [Disclaimer](#disclaimer)
 
@@ -38,16 +41,14 @@ Choose the right binary for your OS between:
 
 #### Approve the app (MacOS)
 
-If you then get a `"bourso-cli" cannot be opened because the developer cannot be verified` error, go to `System Preferences > Security & Privacy > General` and click `Open Anyway`
+On MacOS, you may need to allow the app to run.
 
-If the above doesn't help you, make sure the file is executable:
-```sh
-chmod +x bourso-cli
-# if it still says `Permission denied`, try
-chown 777 bourso-cli
+Make sure you move the app to your Applications folder before running it.
+
+Then run the following command in your terminal:
 ```
-
-⚠️ Signing in with a different IP address than the ones you usually use will trigger a security check from Bourso. You'll have to validate the connection from your phone. A [GitHub pull request](https://github.com/azerpas/bourso-api/pull/10) is open to handle this case.
+xattr -r -d com.apple.quarantine /path/to/bourso-cli
+```
 
 #### Verify your installation
 Bourso CLI embeds [SLSA](https://slsa.dev/) standard to verify the integrity of the binary. You can verify the signature of the binary by:
@@ -80,6 +81,8 @@ Save your client ID with this config command:
 ./bourso-cli config
 ```
 The password will be asked each time you run the app to avoid storing it in a file.
+
+⚠️ Signing in with a different IP address than the ones you usually use will trigger a security check from Bourso. You'll have to complete the MFA (Multi-Factor Authentication) process to log in successfully.
 
 ### Get your accounts
 ```
@@ -126,6 +129,15 @@ INFO  bourso_cli > Fetching quotes...
 INFO  bourso_cli > Average quote: 494.5348136363637
 ```
 Subcommands available: `highest`, `lowest`, `average`, `volume`, `last`
+
+### Transfer funds
+Transfer 10€ between your accounts:
+```
+./bourso-cli transfer --account a583f3c5842c34fb00b408486ef493e0 --to b419f2d28010bafb331badef11bba51e --amount 10
+```
+*Tip: You can get the accounts ids from the [`accounts` command](#get-your-accounts)*
+
+Amount can be a decimal with minimum being 10,0€.
 
 ### DCA (Dollar Cost Averaging) investing
 
@@ -186,6 +198,15 @@ $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoExit -
 # Create a task named "Weekly Bourso CLI Task"
 Register-ScheduledTask -TaskName "Weekly Bourso CLI Task" -Trigger $trigger -Action $action
 ```
+
+## Contributors
+- [azerpas](https://github.com/azerpas)
+- [Mathious6](https://github.com/Mathious6)
+- [mquandalle](https://github.com/mquandalle)
+- [pierrediancourt](https://github.com/pierrediancourt)
+
+## Contributing
+Contributions are welcome! Feel free to open issues or submit pull requests.
 
 ## Security
 This app runs locally. All outbound/inbound data is sent/received to/from BoursoBank servers **only**. Your password will not be saved locally and will be asked each time you run the app. Your client ID has to be configurated and will be saved into the app data for next usages.
